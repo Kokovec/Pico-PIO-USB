@@ -201,11 +201,25 @@ uint8_t __no_inline_not_in_flash_func(pio_usb_bus_wait_handshake)(pio_port_t* pp
   return pp->usb_rx_buffer[1];
 }
 
+// VECTREX PATCH: packets received with stray bits in front of the SYNC and realigned, and the
+// number of stray bits in the last one
+volatile uint32_t pio_usb_realigned_packets;
+volatile uint8_t pio_usb_realigned_shift;
+
 int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
     pio_port_t *pp, uint8_t handshake) {
   if (!pio_usb_bus_wait_for_rx_start(pp)) {
     return -1;
   }
+
+  // VECTREX PATCH: some hubs' own data packets are decoded with one or more stray bits in front
+  // of the SYNC, so every byte arrives shifted (the SYNC reads 01 instead of 80 for one stray
+  // bit) and the CRC fails every time. The shift is found from the first two bytes, where the
+  // SYNC pattern 0x80 must appear, and the packet is realigned on the fly:
+  //   true byte n = (raw n >> shift) | (raw n+1 << (8 - shift))
+  // The packet's last `shift` bits stay in the decoder, so the CRC check covers 16 - shift bits.
+  uint8_t shift = 0;
+  uint8_t prev_raw = 0;
 
   uint16_t crc = 0xffff;
   uint16_t crc_prev = 0xffff;
@@ -235,25 +249,67 @@ int __no_inline_not_in_flash_func(pio_usb_bus_receive_packet_and_handshake)(
   while (get_time_us_32() - start <= 7) {
     if (pio_sm_get_rx_fifo_level(pp->pio_usb_rx, pp->sm_rx)) {
       uint8_t data = pio_sm_get(pp->pio_usb_rx, pp->sm_rx) >> 24;
-      if (idx < rx_buf_len) {
-        pp->usb_rx_buffer[idx] = data;
-      }
       start = get_time_us_32(); // reset timeout when a byte is received
 
-      if (idx >= 2) {
-        crc_prev2 = crc_prev;
-        crc_prev = crc;
-        crc = update_usb_crc16(crc, data);
-        crc_receive = (crc_receive >> 8) | (data << 8);
-        crc_receive_inverse = crc_receive ^ 0xffff;
-        crc_match = (crc_receive_inverse == crc_prev2);
+      // VECTREX PATCH: SYNC not at the start? Look for it in the first two bytes.
+      if (idx == 1 && prev_raw != 0x80) {
+        uint16_t const first = (uint16_t) (prev_raw | (data << 8));
+        for (uint8_t k = 1; k < 8; k++) {
+          if (((first >> k) & 0xff) == 0x80) {
+            shift = k;
+            break;
+          }
+        }
       }
+
+      if (!shift) {
+        if (idx < rx_buf_len) {
+          pp->usb_rx_buffer[idx] = data;
+        }
+        if (idx >= 2) {
+          crc_prev2 = crc_prev;
+          crc_prev = crc;
+          crc = update_usb_crc16(crc, data);
+          crc_receive = (crc_receive >> 8) | (data << 8);
+          crc_receive_inverse = crc_receive ^ 0xffff;
+          crc_match = (crc_receive_inverse == crc_prev2);
+        }
+      } else {
+        // VECTREX PATCH: true byte idx-1 is complete now that its last bits have arrived
+        uint8_t const s = (uint8_t) ((prev_raw >> shift) | (data << (8 - shift)));
+        if (idx - 1 < rx_buf_len) {
+          pp->usb_rx_buffer[idx - 1] = s;
+        }
+        if (idx - 1 >= 2) {
+          crc_prev2 = crc_prev;
+          crc_prev = crc;
+          crc = update_usb_crc16(crc, s);
+          crc_receive = (crc_receive >> 8) | (s << 8);
+        }
+      }
+      prev_raw = data;
       idx++;
     } else if ((pp->pio_usb_rx->irq & IRQ_RX_COMP_MASK) != 0) {
       // Exit since we've gotten an EOP.
       // Timing critical: per USB specs, handshake must be sent within 2-7 bit-time strictly
       if (pp->low_speed) {
         busy_wait_at_least_cycles(turnaround_in_cycle); // wait for turnaround for LS only
+      }
+
+      // VECTREX PATCH: finish a realigned packet. Its last byte is missing its top `shift` bits
+      // (still in the decoder), which are the top bits of the received CRC.
+      if (shift && idx >= 4) {
+        uint8_t const s_last = prev_raw >> shift;
+        if (idx - 1 < rx_buf_len) {
+          pp->usb_rx_buffer[idx - 1] = s_last;
+        }
+        uint16_t const received = (uint16_t) ((crc_receive >> 8) | (s_last << 8));
+        uint16_t const mask = (uint16_t) (0xffffu >> shift);
+        crc_match = (((received ^ 0xffff) & mask) == (crc_prev & mask));
+        if (crc_match) {
+          pio_usb_realigned_packets++;
+          pio_usb_realigned_shift = shift;
+        }
       }
 
       if (handshake == USB_PID_ACK) {
